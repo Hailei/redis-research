@@ -1,0 +1,76 @@
+redis复制过程
+backlog命令协议文本 为psync增量同步，同时写给salves
+
+redis.c 1761 
+
+if (flags & REDIS_PROPAGATE_REPL)
+        replicationFeedSlaves(server.slaves,dbid,argv,argc);
+
+
+replication.c 141 
+replicationFeedSlaves
+
+ while((ln = listNext(&li))) {
+        redisClient *slave = ln->value;
+
+        /* Don't feed slaves that are still waiting for BGSAVE to start */
+        if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START) continue;
+
+        /* Feed slaves that are waiting for the initial SYNC (so these commands
+         * are queued in the output buffer until the initial SYNC completes),
+         * or are already in sync with the master. */
+
+        /* Add the multi bulk length. */
+        addReplyMultiBulkLen(slave,argc);
+
+        /* Finally any additional argument that was not stored inside the
+         * static buffer if any (from j to argc). */
+        for (j = 0; j < argc; j++)
+            addReplyBulk(slave,argv[j]);
+    }
+
+
+sync的过程如下：
+
+
+客户端执行slave of  host ip，此时slave向master发送sync命令，服务端收到以后，首先检查当前是否在执行bgsave
+如在执行的话，继续检查是否存在处于REDIS_REPL_WAIT_BGSAVE_END的slave，如有那太棒了，直接把这个slave的outputbuffer copy到
+client中，但此时并不会将这些内容写回slave，因为还没有注册sendReply回调，只是累积在client的outputbuffer中。
+
+listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
+            slave = ln->value;
+            if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END) break;
+        }
+        if (ln) {
+            /* Perfect, the server is already registering differences for
+             * another slave. Set the right state, and copy the buffer. */
+            copyClientOutputBuffer(c,slave);
+            c->replstate = REDIS_REPL_WAIT_BGSAVE_END;
+            redisLog(REDIS_NOTICE,"Waiting for end of BGSAVE for SYNC");
+        } else {
+            /* No way, we need to wait for the next BGSAVE in order to
+             * register differences */
+            c->replstate = REDIS_REPL_WAIT_BGSAVE_START;
+            redisLog(REDIS_NOTICE,"Waiting for next BGSAVE for SYNC");
+        }
+
+
+updateSlavesWaitingBgsave
+在bgsave完成以后，将rdbsend到slave。
+
+if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
+                freeClient(slave);
+                continue;
+}
+
+主要是给slave的write注册sendBulkToSlave回调，在sendBulkToSlave中完成rdb的传输。
+接下来注册sendReplyToClient，将累积的reply写回。
+
+回顾一下：
+
+    1.  slave执行sync 服务端检查是否在bgsave，如存在再检查是否存在处于REDIS_REPL_WAIT_BGSAVE_END的other slaver，如存在那就太棒了
+        只需将那个slave的outputbuffer copy到自己。
+
+    2. 如何保证数据的一致的呢？ 首先用bgsave生成一个全量的rdb，当然这只是这个时间的内存快照，在此以后的Object将会写在client的outputbuffer中，
+       直到client接收到完整rdb，将增量的reply发给client(slave)
