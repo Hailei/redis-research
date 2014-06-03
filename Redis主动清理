@@ -1,0 +1,147 @@
+1. 通过命令打开或者关闭主动清理
+* Expire keys by random sampling. Not required for slaves
+     * as master will synthesize DELs for us. */
+    if (server.active_expire_enabled && server.masterhost == NULL)
+        activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);
+        
+由此可见，是通过修改server.active_expire_enabled的值来实现关闭主动清理策略。
+
+ } else if (!strcasecmp(c->argv[1]->ptr,"set-active-expire") &&
+               c->argc == 3)
+    {
+        server.active_expire_enabled = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+        
+在debug.c，redis的debug命令提供了debug set-active-expire 0来关闭主动清理
+
+2. redis的主动清理时机分为两种，一种是在处理IO Event之前的beforeSleep执行快速清理调用activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+，另一种是定时执行在databaseCron函数中，调用activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW)。都是调用activeExpireCycle，只是参数不用。
+
+下面来看看activeExpireCycle的具体执行
+
+ /* This function has some global state in order to continue the work
+     * incrementally across calls. */
+    //以下变量都是static，用来记录上次执行的情况。static变量不同于
+      局部变量的生命周期。
+    static unsigned int current_db = 0; /* Last DB tested. */
+    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
+
+    unsigned int j, iteration = 0;
+    unsigned int dbs_per_call = REDIS_DBCRON_DBS_PER_CALL;
+    long long start = ustime(), timelimit;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        /* Don't start a fast cycle if the previous cycle did not exited
+         * for time limt. Also don't repeat a fast cycle for the same period
+         * as the fast cycle total duration itself. */
+        if (!timelimit_exit) return;//如果上一次执行不是因为超时退出，则不进行本次清理
+        if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+        last_fast_cycle = start;
+    }
+
+    /* We usually should test REDIS_DBCRON_DBS_PER_CALL per iteration, with
+     * two exceptions:
+     *
+     * 1) Don't test more DBs than we have.
+     * 2) If last time we hit the time limit, we want to scan all DBs
+     * in this iteration, as there is work to do in some DB and we don't want
+     * expired keys to use memory for too much time. */
+    if (dbs_per_call > server.dbnum || timelimit_exit)
+        dbs_per_call = server.dbnum;
+
+    /* We can use at max ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC percentage of CPU time
+     * per iteration. Since this function gets called with a frequency of
+     * server.hz times per second, the following is the max amount of
+     * microseconds we can spend in this function. */
+   //如果是slow的话，每次执行清理的时间不会超过cpu time的25%
+    timelimit = 1000000 *  0.25 / 10 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
+    
+    timelimit_exit = 0;
+    if (timelimit <= 0) timelimit = 1;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
+
+    for (j = 0; j < dbs_per_call; j++) {
+        int expired;
+        redisDb *db = server.db+(current_db % server.dbnum);
+
+        /* Increment the DB now so we are sure if we run out of time
+         * in the current DB we'll restart from the next. This allows to
+         * distribute the time evenly across DBs. */
+        current_db++;
+
+        /* Continue to expire if at the end of the cycle more than 25%
+         * of the keys were expired. */
+        do {
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
+
+            /* If there is nothing to expire try next DB ASAP. */
+           //num  db中key的总数量
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
+           //槽数，hash表中链表数组的长度
+            slots = dictSlots(db->expires);
+            now = mstime();
+
+            /* When there are less than 1% filled slots getting random
+             * keys is expensive, so stop here waiting for better times...
+             * The dictionary will be resized asap. */
+            if (num && slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            /* The main collection cycle. Sample random keys among keys
+             * with an expire set, checking for expired ones. */
+            expired = 0;// 每次把expired重置为0
+            ttl_sum = 0;
+            ttl_samples = 0;
+           //ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP=20
+             每次loop随机从exipre sets中查找20个kv
+            if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+                num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
+
+            while (num--) {
+                dictEntry *de;
+                long long ttl;
+
+                if ((de = dictGetRandomKey(db->expires)) == NULL) break;
+                ttl = dictGetSignedIntegerVal(de)-now;
+                //尝试过期，如果该kv真的过期，计数
+                if (activeExpireCycleTryExpire(db,de,now)) expired++;
+                if (ttl < 0) ttl = 0;
+                ttl_sum += ttl;
+                ttl_samples++;
+            }
+            //统计更新avg_ttl
+            /* Update the average TTL stats for this database. */
+            if (ttl_samples) {
+                long long avg_ttl = ttl_sum/ttl_samples;
+
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                /* Smooth the value averaging with the previous one. */
+                db->avg_ttl = (db->avg_ttl+avg_ttl)/2;
+            }
+
+            /* We can't block forever here even if there are many keys to
+             * expire. So after a given amount of milliseconds return to the
+             * caller waiting for the other active expire cycle. */
+            //避免有大量要清理的kv阻塞IO，每隔16次检查清理是否超时，slow清理的timelimit是25ms
+            iteration++;
+            if ((iteration & 0xf) == 0 && /* check once every 16 iterations. */
+                (ustime()-start) > timelimit)
+            {
+                timelimit_exit = 1;
+            }
+            if (timelimit_exit) return;
+            /* We don't repeat the cycle if there are less than 25% of keys
+             * found expired in the current DB. */
+          //如果本次loop清理的kv小于25%则退出
+        } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
+    }
+}
+
