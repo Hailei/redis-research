@@ -1,0 +1,14 @@
+       客户端执行slaveof host ip  执行slaveofCommand，在该函数中replicationSetMaster(c->argv[1]->ptr, port);设置master的host和ip，同时设置 server.repl_state = REDIS_REPL_CONNECT。
+
+在replicationCron中
+/* Check if we should connect to a MASTER */
+    if (server.repl_state == REDIS_REPL_CONNECT) {
+        redisLog(REDIS_NOTICE,"Connecting to MASTER %s:%d",
+            server.masterhost, server.masterport);
+        if (connectWithMaster() == REDIS_OK) {
+            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync started");
+        }
+    }
+如果server.repl_state为REDIS_REPL_CONNECT调用connectWithMaster。
+connectWithMaster，调用anetTcpNonBlockConnect，然后创建该fd的读写事件回调syncWithMaster。
+
