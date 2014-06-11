@@ -1,0 +1,33 @@
+redis处理一个请求的过程
+networking.c readQueryFromClient() --->processInputBuffer()->
+redis.c   processCommand()--->call()
+
+ long long dirty, start = ustime(), duration;//记录方法执行开始的时间
+    int client_old_flags = c->flags;
+
+    /* Sent the command to clients in MONITOR mode, only if the commands are
+     * not generated from reading an AOF. */
+    if (listLength(server.monitors) &&
+        !server.loading &&
+        !(c->cmd->flags & REDIS_CMD_SKIP_MONITOR))
+    {
+        replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
+    }
+
+    /* Call the command. */
+    c->flags &= ~(REDIS_FORCE_AOF|REDIS_FORCE_REPL);
+    redisOpArrayInit(&server.also_propagate);
+    dirty = server.dirty;
+    //执行具体的command
+    c->cmd->proc(c);
+    dirty = server.dirty-dirty;
+    //执行完成，记录执行时间。由此可见slowlog中记录的是command具体执行的时间，不包含等待网络传输时间，
+    //redis的写是先写到client的buffer，然后注册写事件，等下一次poll loop的时候再真正写回客户端。
+    duration = ustime()-start;
+    
+    /* Log the command into the Slow log if needed, and populate the
+     * per-command statistics that we show in INFO commandstats. */
+    if (flags & REDIS_CALL_SLOWLOG && c->cmd->proc != execCommand)
+        slowlogPushEntryIfNeeded(c->argv,c->argc,duration);
+        
+  
