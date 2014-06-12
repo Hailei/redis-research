@@ -1,0 +1,24 @@
+rio struct
+
+/* The update_cksum method if not NULL is used to compute the checksum of
+     * all the data that was read or written so far. The method should be
+     * designed so that can be called with the current checksum, and the buf
+     * and len fields pointing to the new block of data to add to the checksum
+     * computation. */
+    void (*update_cksum)(struct _rio *, const void *buf, size_t len);
+update_cksum为回调函数，每次在write(或read)的时候，将当前要写入的数据buf和以前数据的checksum计算出新的checksum，这个crc是一个增量
+的算法，而不是每次从重新计算。
+redis中使用的crc算法是crc-64-jones crc的一种变种算法
+
+uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l) {
+    uint64_t j;
+
+    for (j = 0; j < l; j++) {
+        uint8_t byte = s[j];
+        crc = crc64_tab[(uint8_t)crc ^ byte] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+比rsync中的rolling checksum算法还要简洁
+
