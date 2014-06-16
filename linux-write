@@ -6,3 +6,26 @@ page-writeback.c balance_dirty_pages_ratelimited(mapping)调用
  * Sleep at most 200ms at a time in balance_dirty_pages().
  */
 #define MAX_PAUSE		max(HZ/5, 1)
+
+
+mmzone.h  
+
+
+NR_FILE_MAPPED  page cache
+
+unmapped_ratio = 100 - ((global_page_state(NR_FILE_MAPPED) +
+				global_page_state(NR_ANON_PAGES)) * 100) /
+					total_pages;
+					
+					
+					
+total_pages  去掉pagecache以后的free 内存
+
+NR_FILE_MAPPED == page cache  NR_ANON_PAGES 匿名映射页
+
+
+100 - （pagecache + 匿名映射页）/ total_pages(free 去除掉page cache)
+
+
+
+
