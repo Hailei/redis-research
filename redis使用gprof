@@ -1,0 +1,63 @@
+一. 在Makefile中的编译和链接选项中添加-pg
+GPROF=-pg
+编译
+
+FINAL_CFLAGS=$(STD) $(WARN) $(GPROF) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS) 
+
+链接
+
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ)
+        $(REDIS_LD) $(GPROF)  -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a $(FINAL_LIBS)
+
+
+二. 以分析save为例，启动redis，执行save，然后客户端调用shutdown，然后在redis-server的调用路径下产生gmon.out,特别注意gprof一定
+是在main或者exit(0)退出时才会产生gmon.out,shutdown命令正好是exit(0).
+
+三. 使用gprof分析gmon.out。gprof /opt/redis-2.8.3/bin/redis-server  gmon.out > profile_only_only_compress.txt
+
+四. 分析结果
+
+Each sample counts as 0.01 seconds.
+  %   cumulative   self              self     total
+ time   seconds   seconds    calls   s/call   s/call  name
+ 15.25      4.68     4.68 51543711     0.00     0.00  dictFind
+  9.79      7.69     3.01 10140781     0.00     0.00  dictNext
+  9.16     10.50     2.81 49437342     0.00     0.00  dictSdsKeyCompare
+  
+15.25%说明 dictFind占用cpu使用时间的15.25%  
+通过以上得知dictFind,dictNext，耗cpu时间比较多。这时我们想看看dictFind和dictNext都在哪儿调用，函数调用链是怎么样的？
+
+在Call Graph一节中就是展示函数的调用链
+
+               0.00    0.00   14855/30976309     dictReplace [96]
+                0.00    0.00   14855/30976309     dbOverwrite [80]
+                0.01    0.02  154856/30976309     dictReplaceRaw [51]
+                0.01    0.02  154856/30976309     setExpire [37]
+                0.01    0.02  169710/30976309     getExpire [49]
+                0.88    1.37 10155585/30976309     lookupKey [13]
+                0.88    1.37 10155585/30976309     removeExpire [12]
+                0.88    1.37 10156007/30976309     dictFetchValue [14]
+[7]     39.2    2.69    4.19 30976309         dictFind [7]
+                1.88    0.40 6782414/10190862     dictRehash [8]
+                1.07    0.00 20564149/29011824     dictSdsKeyCompare [15]
+                0.48    0.00 20820300/48306516     dictSdsHash [16]
+                0.25    0.00 20820300/48306516     dictGenHashFunction [24]
+                0.08    0.00 10156007/10156690     dictGenCaseHashFunction [45]
+                0.01    0.00 6782414/10185148     _dictRehashStep [71]
+                0.00    0.00 10156007/10156690     dictSdsCaseHash [101]
+                0.00    0.00 10156244/10156472     dictSdsKeyCaseCompare [17
+                
+dictFind[7](7为index)在setExpire或者getExpire中被调用。注意函数名的层次对齐，
+
+[7]     39.2    2.69    4.19 30976309         dictFind [7]
+                1.88    0.40 6782414/10190862     dictRehash [8]
+表示dictRehash被dictFind调用，  1.88    0.40 6782414/10190862     dictRehash [8]，6782414/10190862，6782414为被dictFind调用的次数，
+
+10190862表示该函数的总调用次数。
+
+结合源码分析得知，在rdb save过程，迭代遍历hashtable中每个key，首先会调用getExpire查看key是否过期，如已过期，则不需要再写入dump中
+redis的expiretime是存在叫epxires的hashtable中，每次调用都会调用dictFind获取过期时间。所以dictFind调用次数很多，耗时最多
+
+
+
+
