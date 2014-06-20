@@ -1,0 +1,38 @@
+wait_on_page_writeback linux/pagemap.h
+wait_on_page_writeback_range  mm/filemap.c
+filemap_fdatawait mm/filemap.c
+__sync_single_inode  fs\fs-writeback.c 
+
+
+ret = do_writepages(mapping, wbc);
+
+	/* Don't write the inode if only I_DIRTY_PAGES was set */
+	if (dirty & (I_DIRTY_SYNC | I_DIRTY_DATASYNC)) {
+		int err = write_inode(inode, wait);
+		if (ret == 0)
+			ret = err;
+	}
+
+	if (wait) {
+		int err = filemap_fdatawait(mapping);
+		if (ret == 0)
+			ret = err;
+	}
+	
+	
+generic_writepages linux\mpage.h
+generic_writepages fs\mpage.c
+
+ 0xffffffff8001cede : mpage_writepages+0x0/0x37d [kernel]
+ 0xffffffff8005a847 : do_writepages+0x29/0x2f [kernel]
+ 0xffffffff8002f92f : __writeback_single_inode+0x1a2/0x31c [kernel]
+ 0xffffffff8002100f : sync_sb_inodes+0x1b7/0x271 [kernel]
+ 0xffffffff80050cad : writeback_inodes+0x82/0xd8 [kernel]
+ 0xffffffff800ccb77 : balance_dirty_pages_ratelimited_nr+0x16d/0x27a [kernel]
+ 0xffffffff8000ff20 : generic_file_buffered_write+0x20b/0x6a9 [kernel]
+ 0xffffffff80016735 : __generic_file_aio_write_nolock+0x369/0x3b6 [kernel]
+ 0xffffffff8002188b : generic_file_aio_write+0x67/0xc3 [kernel]
+ 
+ 
+ 从code上来看，balance_dirty_pages_ratelimited_nr->balance_dirty_pages->writeback_inodes 从如上systemtap捕获的堆栈来看却看不到
+ balance_dirty_pages，我开始怀疑是不是源码和内核的版本对不上，后来才想到应该是内联上，再次确实balance_dirty——pages声明的
