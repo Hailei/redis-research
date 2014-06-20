@@ -35,4 +35,23 @@ generic_writepages fs\mpage.c
  
  
  从code上来看，balance_dirty_pages_ratelimited_nr->balance_dirty_pages->writeback_inodes 从如上systemtap捕获的堆栈来看却看不到
- balance_dirty_pages，我开始怀疑是不是源码和内核的版本对不上，后来才想到应该是内联上，再次确实balance_dirty——pages声明的
+ balance_dirty_pages，我开始怀疑是不是源码和内核的版本对不上，后来才想到应该是内联上，再次确实balance_dirty_pages声明的
+
+
+void balance_dirty_pages_ratelimited_nr(struct address_space *mapping,
+					unsigned long nr_pages_dirtied);
+
+static inline void
+balance_dirty_pages_ratelimited(struct address_space *mapping)
+{
+	balance_dirty_pages_ratelimited_nr(mapping, 1);
+	
+}
+
+对c语言还是不太懂，于是用systemtap probe balance_dirty_pages.return 
+提示如下error：
+
+semantic error: no match while resolving probe point kernel.function("balance_dirty_pages").return
+Pass 2: analysis failed.  Try again with another '--vp 01' option.
+
+果然是内联函数
