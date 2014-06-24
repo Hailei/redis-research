@@ -11,4 +11,199 @@
     }
 如果server.repl_state为REDIS_REPL_CONNECT调用connectWithMaster。
 connectWithMaster，调用anetTcpNonBlockConnect，然后创建该fd的读写事件回调syncWithMaster。
+同步的逻辑都包含在syncWithMaster中，
 
+如果repl_state为REDIS_REPL_CONNECTING，正在connect，向master发送一个ping命令，检查master是否活着
+if (server.repl_state == REDIS_REPL_CONNECTING) {
+        redisLog(REDIS_NOTICE,"Non blocking connect for SYNC fired the event.");
+        /* Delete the writable event so that the readable event remains
+         * registered and we can wait for the PONG reply. */
+         //删除写事件，只留下读事件接下来等待读取服务端的PONG
+        aeDeleteFileEvent(server.el,fd,AE_WRITABLE);
+        server.repl_state = REDIS_REPL_RECEIVE_PONG;
+        /* Send the PING, don't check for errors at all, we have the timeout
+         * that will take care about this. */
+         //阻塞地向服务发送ping，这里设置了一个timeout 100ms
+        syncWrite(fd,"PING\r\n",6,100);
+        return;//直接返回等待下次poll的时候接收PONG
+}
+
+这里采用了一个有限状态机的模式，接上面的处理，如果向master发送PING以后repl_state状态由REDIS_REPL_CONNECTING
+迁移到REDIS_REPL_RECEIVE_PONG，因为读写事件都是注册的syncWithMaster，通过全局的状态变迁来决定接下来处理那部分逻辑
+/* Receive the PONG command. */
+    if (server.repl_state == REDIS_REPL_RECEIVE_PONG) {
+        char buf[1024];
+
+        /* Delete the readable event, we no longer need it now that there is
+         * the PING reply to read. */
+        aeDeleteFileEvent(server.el,fd,AE_READABLE);
+
+        /* Read the reply with explicit timeout. */
+        buf[0] = '\0';
+        if (syncReadLine(fd,buf,sizeof(buf),
+            server.repl_syncio_timeout*1000) == -1)
+        {
+            redisLog(REDIS_WARNING,
+                "I/O error reading PING reply from master: %s",
+                strerror(errno));
+            goto error;
+        }
+
+        /* We accept only two replies as valid, a positive +PONG reply
+         * (we just check for "+") or an authentication error.
+         * Note that older versions of Redis replied with "operation not
+         * permitted" instead of using a proper error code, so we test
+         * both. */
+        //接收PONG
+        if (buf[0] != '+' &&
+            strncmp(buf,"-NOAUTH",7) != 0 &&
+            strncmp(buf,"-ERR operation not permitted",28) != 0)
+        {
+            redisLog(REDIS_WARNING,"Error reply to PING from master: '%s'",buf);
+            goto error;
+        } else {
+            redisLog(REDIS_NOTICE,
+                "Master replied to PING, replication can continue...");
+        }
+    }
+    
+    
+    接下来尝试发送PSYNC，PSYNC不行的话，发送SYNC进行全量同步
+这些命令都是同步发送的。
+发送成功以后注册读事件的回调readSyncBulkPayload读取全量的RDB
+    
+    
+      /* Setup the non blocking download of the bulk file. */
+    if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
+            == AE_ERR)
+    {
+        redisLog(REDIS_WARNING,
+            "Can't create readable event for SYNC: %s (fd=%d)",
+            strerror(errno),fd);
+        goto error;
+    }
+    
+    
+ 读取RDB的过程
+ 
+ 首先来读取RDB的size，这里是一个简单length-body的协议
+    
+ /* If repl_transfer_size == -1 we still have to read the bulk length
+     * from the master reply. */
+    if (server.repl_transfer_size == -1) {
+        if (syncReadLine(fd,buf,1024,server.repl_syncio_timeout*1000) == -1) {
+            redisLog(REDIS_WARNING,
+                "I/O error reading bulk count from MASTER: %s",
+                strerror(errno));
+            goto error;
+        }
+
+        //- 说明报错了
+        if (buf[0] == '-') {
+            redisLog(REDIS_WARNING,
+                "MASTER aborted replication with an error: %s",
+                buf+1);
+            goto error;
+        // 空行 心跳 用来更新repl_transfer_lastio
+        } else if (buf[0] == '\0') {
+            /* At this stage just a newline works as a PING in order to take
+             * the connection live. So we refresh our last interaction
+             * timestamp. */
+            server.repl_transfer_lastio = server.unixtime;
+            return;
+        } else if (buf[0] != '$') {
+            redisLog(REDIS_WARNING,"Bad protocol from MASTER, the first byte is not '$' (we received '%s'), are you sure the host and port are right?", buf);
+            goto error;
+        }
+        server.repl_transfer_size = strtol(buf+1,NULL,10);//rdb sie
+        redisLog(REDIS_NOTICE,
+            "MASTER <-> SLAVE sync: receiving %lld bytes from master",
+            (long long) server.repl_transfer_size);
+        return;
+    }
+
+    /* Read bulk data */
+    left = server.repl_transfer_size - server.repl_transfer_read;
+    readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
+    nread = read(fd,buf,readlen);//从socket中读取readlean字节的数据
+    if (nread <= 0) {
+        redisLog(REDIS_WARNING,"I/O error trying to sync with MASTER: %s",
+            (nread == -1) ? strerror(errno) : "connection lost");
+        replicationAbortSyncTransfer();
+        return;
+    }
+    server.repl_transfer_lastio = server.unixtime;//更新repl_transfer_lastio
+    //写入rdb的临时文件
+    if (write(server.repl_transfer_fd,buf,nread) != nread) {
+        redisLog(REDIS_WARNING,"Write error or short write writing to the DB dump file needed for MASTER <-> SLAVE synchronization: %s", strerror(errno));
+        goto error;
+    }
+    server.repl_transfer_read += nread;
+
+    /* Sync data on disk from time to time, otherwise at the end of the transfer
+     * we may suffer a big delay as the memory buffers are copied into the
+     * actual disk. */
+    if (server.repl_transfer_read >=
+        server.repl_transfer_last_fsync_off + REPL_MAX_WRITTEN_BEFORE_FSYNC)
+    {
+        off_t sync_size = server.repl_transfer_read -
+                          server.repl_transfer_last_fsync_off;
+        rdb_fsync_range(server.repl_transfer_fd,
+            server.repl_transfer_last_fsync_off, sync_size);
+        server.repl_transfer_last_fsync_off += sync_size;
+    }
+    
+    
+   不断地从master接收rdb直到完全完成，删除socket的读事件，这个非常重要，master会在send rdb完成以后注册socket的写事件，
+   这时候dump rdb和send rdb阶段的累积的command写回slave。所以需要先删除事件，等rdb load完成以后再重新注册。
+   然后清空当前db，loadRDB。我最初看这段代码的时候觉得很蹊跷，rdb load以后没有重新注册read事件，如何从master接收增量的
+   同步。后来才发现 在createClient的时候会注册readQueryFromClient
+    /* Check if the transfer is now complete */
+    if (server.repl_transfer_read == server.repl_transfer_size) {
+        if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
+            redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+            replicationAbortSyncTransfer();
+            return;
+        }
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Flushing old data");
+        signalFlushedDb(-1);
+        emptyDb(replicationEmptyDbCallback);
+        /* Before loading the DB into memory we need to delete the readable
+         * handler, otherwise it will get called recursively since
+         * rdbLoad() will call the event loop to process events from time to
+         * time for non blocking loading. */
+        aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Loading DB in memory");
+        if (rdbLoad(server.rdb_filename) != REDIS_OK) {
+            redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+            replicationAbortSyncTransfer();
+            return;
+        }
+        /* Final setup of the connected slave <- master link */
+        zfree(server.repl_transfer_tmpfile);
+        close(server.repl_transfer_fd);
+        server.master = createClient(server.repl_transfer_s);
+        server.master->flags |= REDIS_MASTER;
+        server.master->authenticated = 1;
+        server.repl_state = REDIS_REPL_CONNECTED;
+        server.master->reploff = server.repl_master_initial_offset;
+        memcpy(server.master->replrunid, server.repl_master_runid,
+            sizeof(server.repl_master_runid));
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
+        /* Restart the AOF subsystem now that we finished the sync. This
+         * will trigger an AOF rewrite, and when done will start appending
+         * to the new file. */
+        if (server.aof_state != REDIS_AOF_OFF) {
+            int retry = 10;
+
+            stopAppendOnly();
+            while (retry-- && startAppendOnly() == REDIS_ERR) {
+                redisLog(REDIS_WARNING,"Failed enabling the AOF after successful master synchronization! Trying it again in one second.");
+                sleep(1);
+            }
+            if (!retry) {
+                redisLog(REDIS_WARNING,"FATAL: this slave instance finished the synchronization with its master, but the AOF can't be turned on. Exiting now.");
+                exit(1);
+            }
+        }
+    }
