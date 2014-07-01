@@ -27,5 +27,100 @@ NR_FILE_MAPPED == page cache  NR_ANON_PAGES 匿名映射页
 100 - （pagecache + 匿名映射页）/ total_pages(free 去除掉page cache)
 
 
+以EXT3文件系统为例，
+fs/read_write.c
+vfs_write中
+
+ret = rw_verify_area(WRITE, file, pos, count);
+	if (ret >= 0) {
+		count = ret;
+		ret = security_file_permission (file, MAY_WRITE);
+		if (!ret) {
+			if (file->f_op->write)//查看相应文件系统的addreass_operation
+				ret = file->f_op->write(file, buf, count, pos);
+			else
+				ret = do_sync_write(file, buf, count, pos);
+			if (ret > 0) {
+				fsnotify_modify(file->f_dentry);
+				current->wchar += ret;
+			}
+			current->syscw++;
+		}
+	}
+
+
+const struct file_operations ext3_file_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= do_sync_read,
+	.write		= do_sync_write,
+	.aio_read	= generic_file_aio_read,
+	.aio_write	= ext3_file_write,
+	.readv		= generic_file_readv,
+	.writev		= generic_file_writev,
+	.ioctl		= ext3_ioctl,
+	.mmap		= generic_file_mmap,
+	.open		= generic_file_open,
+	.release	= ext3_release_file,
+	.fsync		= ext3_sync_file,
+	.sendfile	= generic_file_sendfile,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= generic_file_splice_write,
+};
+
+调用 do_sync_write
+
+read_write.c中的do _sync_write调用a_ops中的aio_write,在ext3中aio_write对应的是ext3_file_write
+
+ext3_file_write_>mm@filemap.c:generic_file_aio_write->mm@filemap.c:__generic_file_aio_write_nolock->
+
+
+/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
+	if (unlikely(file->f_flags & O_DIRECT)) {
+		written = generic_file_direct_write(iocb, iov,
+				&nr_segs, pos, ppos, count, ocount);
+		if (written < 0 || written == count)
+			goto out;
+		/*
+		 * direct-io write to a hole: fall through to buffered I/O
+		 * for completing the rest of the request.
+		 */
+		pos += written;
+		count -= written;
+	}
+
+           //buffered write 先写到pagecache
+	written = generic_file_buffered_write(iocb, iov, nr_segs,
+			pos, ppos, count, written);
+mm@filemap.c:generic_file_buffered_write
+
+status = a_ops->prepare_write(file, page, offset, offset+bytes);
+
+
+static const struct address_space_operations ext3_ordered_aops = {
+	.readpage	= ext3_readpage,
+	.readpages	= ext3_readpages,
+	.writepage	= ext3_ordered_writepage,
+	.sync_page	= block_sync_page,
+	.prepare_write	= ext3_prepare_write,
+	.commit_write	= ext3_ordered_commit_write,
+	.bmap		= ext3_bmap,
+	.invalidatepage	= ext3_invalidatepage,
+	.releasepage	= ext3_releasepage,
+	.direct_IO	= ext3_direct_IO,
+	.migratepage	= buffer_migrate_page,
+};
+
+
+ext3_prepare_write
+
+if (test_opt(inode->i_sb, NOBH) && ext3_should_writeback_data(inode))
+		ret = nobh_prepare_write(page, from, to, ext3_get_block);
+	else
+		ret = block_prepare_write(page, from, to, ext3_get_block);
+	if (ret)
+		goto prepare_write_failed;
+
+block_prepare_write
+fs/buffer.c
 
 
