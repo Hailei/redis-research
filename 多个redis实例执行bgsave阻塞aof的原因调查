@@ -1,4 +1,6 @@
-<h1>背景：</h>
+背景:
 
 多个redis实例，打开aof，fsync为none。执行一个实例的bgsave，发现某些请求的RT会便得很高。
+
+因为新上的几台机器cpu是4核的，原来的机器是12核的，开始怀疑是不是cpu的原因。用info commandstats
 
