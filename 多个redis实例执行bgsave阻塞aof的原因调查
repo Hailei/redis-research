@@ -1,6 +1,8 @@
 背景:
 
-多个redis实例，打开aof，fsync为none。执行一个实例的bgsave，发现某些请求的RT会便得很高。
+多个redis实例，打开aof，fsync为none。执行一个实例的bgsave，发现某些请求的RT会便得很高，甚至有一些超时，timeout设置为2000ms。
 
-因为新上的几台机器cpu是4核的，原来的机器是12核的，开始怀疑是不是cpu的原因。用info commandstats
+因为新上的几台机器cpu是4核的，原来的机器是12核的，开始怀疑是不是cpu的原因。用info commandstats查看确实get/set命令
+的平均耗时要比原来低了50%左右，但基本还是us级别。同时用top观察CPU使用率确实很高，达到100%以上。那么在执行bgsave的过程
+
 
