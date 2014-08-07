@@ -1,0 +1,99 @@
+je_malloc
+jemalloc_internal.h
+
+JEMALLOC_INLINE void *  
+imallocx(size_t size, bool try_tcache, arena_t *arena)
+{                       
+        
+        assert(size != 0);
+        
+        if (size <= arena_maxclass)
+                return (arena_malloc(arena, size, false, try_tcache));
+        else
+                return (huge_malloc(size, false));
+}
+
+arena_malloc
+
+internal/arena.h
+
+JEMALLOC_INLINE void *
+arena_malloc(arena_t *arena, size_t size, bool zero, bool try_tcache)
+{
+	tcache_t *tcache;
+
+	assert(size != 0);
+	assert(size <= arena_maxclass);
+
+	if (size <= SMALL_MAXCLASS) {
+		if (try_tcache && (tcache = tcache_get(true)) != NULL)
+			return (tcache_alloc_small(tcache, size, zero));
+		else {
+			return (arena_malloc_small(choose_arena(arena), size,
+			    zero));
+		}
+	} else {
+		/*
+		 * Initialize tcache after checking size in order to avoid
+		 * infinite recursion during tcache initialization.
+		 */
+		if (try_tcache && size <= tcache_maxclass && (tcache =
+		    tcache_get(true)) != NULL)
+			return (tcache_alloc_large(tcache, size, zero));
+		else {
+			return (arena_malloc_large(choose_arena(arena), size,
+			    zero));
+		}
+	}
+}
+
+tcache_alloc_small
+
+internal/tcache.h
+JEMALLOC_INLINE void *
+tcache_alloc_small(tcache_t *tcache, size_t size, bool zero)
+{
+	void *ret;
+	size_t binind;
+	tcache_bin_t *tbin;
+
+	binind = SMALL_SIZE2BIN(size);
+	assert(binind < NBINS);
+	tbin = &tcache->tbins[binind];
+	ret = tcache_alloc_easy(tbin);
+	if (ret == NULL) {
+		ret = tcache_alloc_small_hard(tcache, tbin, binind);
+		if (ret == NULL)
+			return (NULL);
+	}
+	assert(tcache_salloc(ret) == arena_bin_info[binind].reg_size);
+
+	if (zero == false) {
+		if (config_fill) {
+			if (opt_junk) {
+				arena_alloc_junk_small(ret,
+				    &arena_bin_info[binind], false);
+			} else if (opt_zero)
+				memset(ret, 0, size);
+		}
+	} else {
+		if (config_fill && opt_junk) {
+			arena_alloc_junk_small(ret, &arena_bin_info[binind],
+			    true);
+		}
+		VALGRIND_MAKE_MEM_UNDEFINED(ret, size);
+		memset(ret, 0, size);
+	}
+
+	if (config_stats)
+		tbin->tstats.nrequests++;
+	if (config_prof)
+		tcache->prof_accumbytes += arena_bin_info[binind].reg_size;
+	tcache_event(tcache);
+	return (ret);
+}
+
+
+
+
+
