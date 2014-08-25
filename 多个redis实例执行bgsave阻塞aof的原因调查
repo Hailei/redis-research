@@ -1,0 +1,65 @@
+## 背景
+ 
+
+Redis是单进程的，为了发挥多核的优势，我们redis集群采用在单台机器上部署多个redis实例，同时对持久化方式做了改进，采用rdb和增量的aof相结合的方式，appendfsync配置为no。那这样会有一个时段同时进行aof和rdb，当aof和rdb同时进行时，监控系统报警说某些请求Timeout，我们超时设置为2s。另外我们的机器分为两种类型，cpu配置不同，一种是4核，另外一种是12核，timeout发生在4核的机器上。 
+# 分析  #
+解决这个问题还是走了不少弯路的，所以在这儿和大家分享一下。经过一番分析找到一下可能导致慢的原因 
+CPU，rdb过程会有lzf compress以及crc会消耗cpu
+bgsave的fork，fork需要copy page entry table到子进程中去，这个过程是阻塞的
+IO问题，bgsave产生大量的IO，但这是在子进程中完成，应该不会影响主进程吧，在此处埋个伏笔
+
+
+# CPU问题？ 
+因为timeout的问题主要出现在4核的机器上，12核的机器没有问题，所以首先怀疑cpu问题。我用info commandstats查看各个命令执行时间都是us级别，但4核的比12核的慢了近50%。如果是cpu撑不了，这个值应该至少在ms级别。同时profiler分析了redis执行bgsave的函数耗时。在MakeFile中添加-pg，注意编译和链接都需要加，我开始只在编译阶段加了，没有效果。
+<code> 
+GPROF=-pg  
+FINAL_CFLAGS=$(STD) $(WARN) $(GPROF) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)  
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ)  
+        $(REDIS_LD) $(GPROF)  -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a $(FINAL_LIBS)  
+</code>
+
+观察都lzf和crc确实很占用cpu时间是最多的。crc采用一种增量的方式，而不是每次全量，性能应该很高。那么关闭compress和crc以后是否能解决呢？关闭以后问题依旧看来不是cpu的问题。 
+
+# IO问题？  #
+关闭aof以后问题解决，这当中也做了很多尝试，调整bgsave子进程的进程和IO有优先级，将主进程和子进程分别绑定在不同的cpu上，都不管用一度怀疑不是IO的问题。 
+在这里介绍几个工具 
+renice 调整进程的优先级
+ionice 调整进程的IO优先级，当然这是针对block层的IO schedule，为啥不生效，后来才发现，ionice对async write的不起作用，cfq是将async write请求在同一请求队列中不属于进程自己的队列，write(2)一般情况是写入page cache就立马返回，而不是等待真正落入磁盘
+taskset 将指定进程绑定到指定的cpu上
+
+既然write(2)是buffered IO，写先到page cache中，那究竟是什么阻塞了呢？write是不是无限制地使用pagecache，这一点不清楚，这一段时间就狂看各种linux内核相关文档和看源码。 
+发现阻塞write(2)有几种情况： 
+fsync(fdatasync) 会阻塞write
+pdflush会阻塞write
+还有当dirty page超过可用内存的40%，这时候就会调用schedule_timeout阻塞200ms。write并不是仅仅copy到page cache就返回了，他还会检查dirty page的使用比例，如超过了会尝试阻塞地写入磁盘，如果此时不能完全写入，就会调用schedule_timeout从而产生iotimewait，此时使用top观察确实有90%的CPU使用是iotimewait
+
+# 弯路  #
+说说其中的弯路，由于我的粗心放过了一个重大的线索，同事告诉我一个linkhttp://www.redis.io/topics/latency，其中有一节就讲到了aof被大量IO阻塞的问题，作者提到fdatasysnc会阻塞write(2),但我们设置appendfsync为no，不会出现fdatasync和write(2)的阻塞 
+那究竟是什么阻塞了write呢，曾一度怀疑是dirty page超过可用内存的40%导致的拥塞等待。 
+但后来在一台64G内存redis只占用了7G内存的机器上遇到aof阻塞，排除了拥塞等待，那还有什么原因呢？ 
+我查看redis的pullrequesthttps://github.com/antirez/redis/pull/1862，发现idning也遇到了类似问题，提出aof采用单独异步线程write的方案，不过作者有点不感冒没有merge，但他提出可以把文件系统的日志模式改为writeback模式不写日志，我试了会有所改观但不会解决问题。我依然知道到底是什么阻塞了write,这时候我把write的代码整体读了一篇然后用systemtap检测每一个可疑的高耗时函数 
+<code>
+probe kernel.function("__wait_on_bit_lock").return {  
+  
+  if(isinstr(execname(),"redis-server")){  
+       time = gettimeofday_us() - @entry(gettimeofday_us())  
+       if(time > 100000){  
+           printf("trace:%s,pid:%d,function:%s,cost:%d\n",ctime(gettimeofday_s()),pid(),probefunc(),time);  
+           print_stack(backtrace());  
+       }  
+  }  
+  
+}  
+</code>
+锁定在__wait_on_bit_lock，再根据调用堆栈发现有很多地方调用它，比如是read的时候，等待时候把数据从磁盘加载到page中等等。最终定位到一个可疑之处 
+Java代码  收藏代码
+page = __grab_cache_page(mapping,index,&cached_page,&lru_pvec);  
+
+write的时候都会先定位写那个page并尝试lock，而flush dirty page的时候也会先lock住。如果pdflush时，rdb产生大量的IO，那么他有可能尝试占用lock从而 __grab_cache_page等待很长时间。关于这一点我还不是很确定，欢迎大家帮助我确认。 
+
+# 解决Latency的正确流程 
+Redis的作者在[http://www.redis.io/topics/latency](http://www.redis.io/topics/latency "Redis Latency guide line")，已经总结了很多种latency的情况，遇到latency一定要先看它，是否有符合自己的场景，比如我提的问题就是Latency due to AOF and disk I/O，我开始使用了pstack和strace但是都没有定位到阻塞的原因，其实strace可以定位到，但是使用方式不对导致没有捕获到真正的原因。redis2.6以后还提供了watchdog功能，通过config set watchdog打开该功能，就能在日志中打印出慢查询的堆栈。
+
+
+
+
